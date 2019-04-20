@@ -13,6 +13,7 @@ import (
 	"github.com/oklog/run"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
@@ -43,6 +44,16 @@ func runSampler(g *run.Group, logger log.Logger, db *tsdb.DB, configFile string)
 	}
 
 	syncCh := make(chan map[string][]*targetgroup.Group)
+
+	{
+		manager := discovery.NewManager(context.TODO(), logger)
+
+		g.Add(func() error {
+			return manager.Run()
+		}, func(err error) {
+
+		})
+	}
 
 	{
 		_, cancel := context.WithCancel(context.Background())

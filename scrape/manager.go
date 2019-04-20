@@ -14,15 +14,18 @@
 package scrape
 
 import (
+	"context"
+	"fmt"
 	"reflect"
 	"sync"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-
 	"github.com/Go-SIP/conprof/config"
 	"github.com/Go-SIP/conprof/storage/tsdb"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+	"github.com/prometheus/prometheus/discovery"
+	kubernetesSD "github.com/prometheus/prometheus/discovery/kubernetes"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
@@ -39,6 +42,7 @@ func NewManager(logger log.Logger, app Appendable) *Manager {
 	return &Manager{
 		append:        app,
 		logger:        logger,
+		manager:       discovery.NewManager(context.TODO(), log.With(logger, "component", "discovery")),
 		scrapeConfigs: make(map[string]*config.ScrapeConfig),
 		scrapePools:   make(map[string]*scrapePool),
 		graceShut:     make(chan struct{}),
@@ -49,7 +53,9 @@ func NewManager(logger log.Logger, app Appendable) *Manager {
 // Manager maintains a set of scrape pools and manages start/stop cycles
 // when receiving new target groups form the discovery manager.
 type Manager struct {
-	logger    log.Logger
+	logger  log.Logger
+	manager *discovery.Manager
+
 	append    Appendable
 	graceShut chan struct{}
 
@@ -64,6 +70,14 @@ type Manager struct {
 // Run receives and saves target set updates and triggers the scraping loops reloading.
 // Reloading happens in the background so that it doesn't block receiving targets updates.
 func (m *Manager) Run(tsets <-chan map[string][]*targetgroup.Group) error {
+	go func() {
+		err := m.manager.Run()
+		if err != nil {
+			// TODO: Don't panic!
+			panic(err)
+		}
+	}()
+
 	go m.reloader()
 	for {
 		select {
@@ -154,6 +168,30 @@ func (m *Manager) ApplyConfig(cfg *config.Config) error {
 
 	c := make(map[string]*config.ScrapeConfig)
 	for _, scfg := range cfg.ScrapeConfigs {
+		if scfg.ServiceDiscoveryConfig.KubernetesSDConfigs != nil {
+			for _, cfg := range scfg.ServiceDiscoveryConfig.KubernetesSDConfigs {
+				discovery, err := kubernetesSD.New(m.logger, cfg)
+				if err != nil {
+					return fmt.Errorf("failed to initialized kubernetes client: %v", err)
+				}
+
+				targets := make(chan []*targetgroup.Group)
+				discovery.Run(context.TODO(), targets)
+
+				for tgs := range targets {
+					for _, t := range tgs {
+						fmt.Println(t.String())
+					}
+				}
+			}
+		}
+
+		//for _, c := range cfg.KubernetesSDConfigs {
+		//	add(c, func() (Discoverer, error) {
+		//		return kubernetes.New(log.With(m.logger, "discovery", "k8s"), c)
+		//	})
+		//}
+
 		c[scfg.JobName] = scfg
 	}
 	m.scrapeConfigs = c

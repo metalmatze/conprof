@@ -21,8 +21,9 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
+	kubernetesSD "github.com/prometheus/prometheus/discovery/kubernetes"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -149,6 +150,8 @@ type ScrapeConfig struct {
 type ServiceDiscoveryConfig struct {
 	// List of labeled target groups for this job.
 	StaticConfigs []*targetgroup.Group `yaml:"static_configs,omitempty"`
+	// List of Kubernetes service discovery configurations.
+	KubernetesSDConfigs []*kubernetesSD.SDConfig `yaml:"kubernetes_sd_configs,omitempty"`
 }
 
 type ProfilingConfig struct {
