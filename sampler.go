@@ -25,20 +25,97 @@ import (
 	"github.com/go-kit/kit/log/level"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/oklog/run"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/discovery"
 	_ "github.com/prometheus/prometheus/discovery/install" // Register service discovery implementations.
-	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/conprof/conprof/config"
 	"github.com/conprof/conprof/pkg/store"
 	"github.com/conprof/conprof/pkg/store/storepb"
 	"github.com/conprof/conprof/scrape"
 )
+
+type SamplerCmd struct {
+	configFileFlag
+	storeAddressFlag
+	maxMergeBatchSizeFlag
+
+	Targets []string `name:"target" help:"Target to scrape"` // TODO: Are these URLs?
+
+	BearerToken     string `name:"bearer-token" help:"Bearer token to authenticate with store."`
+	BearerTokenFile string `name:"bearer-token-file" type:"path" help:"File to read bearer token from to authenticate with store."`
+
+	Insecure           bool `name:"insecure" help:"Send gRPC requests via plaintext instead of TLS."`
+	InsecureSkipVerify bool `name:"insecure-skip-verify" help:"Skip TLS certificate verification."`
+}
+
+func (cmd *SamplerCmd) Run(cli *cliContext) error {
+	met := grpc_prometheus.NewClientMetrics()
+	met.EnableClientHandlingTimeHistogram()
+	cli.registry.MustRegister(met)
+
+	opts := []grpc.DialOption{
+		grpc.WithUnaryInterceptor(
+			met.UnaryClientInterceptor(),
+		),
+	}
+
+	if cmd.Insecure {
+		opts = append(opts, grpc.WithInsecure())
+	} else {
+		opts = append(opts,
+			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+				InsecureSkipVerify: cmd.InsecureSkipVerify,
+			})),
+		)
+	}
+
+	if cmd.BearerToken != "" && cmd.BearerTokenFile != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(&perRequestBearerToken{
+			token:    cmd.BearerToken,
+			insecure: cmd.Insecure,
+		}))
+	}
+
+	if cmd.BearerTokenFile != "" {
+		b, err := ioutil.ReadFile(cmd.BearerTokenFile)
+		if err != nil {
+			return fmt.Errorf("failed to read bearer token from file: %w", err)
+		}
+		opts = append(opts, grpc.WithPerRPCCredentials(&perRequestBearerToken{
+			token:    string(b),
+			insecure: cmd.Insecure,
+		}))
+	}
+
+	conn, err := grpc.Dial(cmd.StoreAddress, opts...)
+	if err != nil {
+		return err
+	}
+	c := storepb.NewWritableProfileStoreClient(conn)
+
+	samplerOpts := []SamplerOption{
+		WithLogger(cli.logger),
+		WithReloaders(cli.reloaders),
+	}
+
+	if cmd.ConfigFile != "" {
+		samplerOpts = append(samplerOpts, WithConfigFile(cmd.ConfigFile))
+	}
+
+	if len(cmd.Targets) > 0 {
+		samplerOpts = append(samplerOpts, WithTargets(cmd.Targets))
+	}
+
+	s, err := NewSampler(samplerOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to setup sampler: %w", err)
+	}
+
+	return s.Run(cli.probe, store.NewGRPCAppendable(cli.logger, c), cli.reloadCh)
+}
 
 type perRequestBearerToken struct {
 	token    string
@@ -55,66 +132,6 @@ func (t *perRequestBearerToken) RequireTransportSecurity() bool {
 	return !t.insecure
 }
 
-// registerSampler registers a sampler command.
-func registerSampler(m map[string]setupFunc, app *kingpin.Application, name string, reloadCh chan struct{}, reloaders *configReloaders) {
-	cmd := app.Command(name, "Run a sampler, that appends profiles to a configured storage.")
-
-	configFile := cmd.Flag("config.file", "Config file to use.").
-		Default("conprof.yaml").String()
-	targets := cmd.Flag("target", "Targets to scrape.").Strings()
-	storeAddress := cmd.Flag("store", "Address of statically configured store.").
-		Default("127.0.0.1:10901").String()
-	bearerToken := cmd.Flag("bearer-token", "Bearer token to authenticate with store.").String()
-	bearerTokenFile := cmd.Flag("bearer-token-file", "File to read bearer token from to authenticate with store.").String()
-	insecure := cmd.Flag("insecure", "Send gRPC requests via plaintext instead of TLS.").Default("false").Bool()
-	insecureSkipVerify := cmd.Flag("insecure-skip-verify", "Skip TLS certificate verification.").Default("false").Bool()
-
-	m[name] = func(comp component.Component, g *run.Group, mux httpMux, probe prober.Probe, logger log.Logger, reg *prometheus.Registry, debugLogging bool) (prober.Probe, error) {
-		met := grpc_prometheus.NewClientMetrics()
-		met.EnableClientHandlingTimeHistogram()
-		reg.MustRegister(met)
-
-		opts := []grpc.DialOption{
-			grpc.WithUnaryInterceptor(
-				met.UnaryClientInterceptor(),
-			),
-		}
-		if *insecure {
-			opts = append(opts, grpc.WithInsecure())
-		} else {
-			config := &tls.Config{
-				InsecureSkipVerify: *insecureSkipVerify,
-			}
-			opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(config)))
-		}
-
-		if bearerToken != nil && *bearerToken != "" {
-			opts = append(opts, grpc.WithPerRPCCredentials(&perRequestBearerToken{
-				token:    *bearerToken,
-				insecure: *insecure,
-			}))
-		}
-
-		if bearerTokenFile != nil && *bearerTokenFile != "" {
-			b, err := ioutil.ReadFile(*bearerTokenFile)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read bearer token from file: %w", err)
-			}
-			opts = append(opts, grpc.WithPerRPCCredentials(&perRequestBearerToken{
-				token:    string(b),
-				insecure: *insecure,
-			}))
-		}
-
-		conn, err := grpc.Dial(*storeAddress, opts...)
-		if err != nil {
-			return probe, err
-		}
-		c := storepb.NewWritableProfileStoreClient(conn)
-		return probe, runSampler(g, probe, logger, store.NewGRPCAppendable(logger, c), *configFile, *targets, reloadCh, reloaders)
-	}
-}
-
 func getScrapeConfigs(cfg *config.Config) map[string]discovery.Configs {
 	c := make(map[string]discovery.Configs)
 	for _, v := range cfg.ScrapeConfigs {
@@ -123,41 +140,66 @@ func getScrapeConfigs(cfg *config.Config) map[string]discovery.Configs {
 	return c
 }
 
-func managerReloader(logger log.Logger, reloadCh chan struct{}, configFile string, reloaders *configReloaders) {
-	for {
-		<-reloadCh
-		level.Info(logger).Log("msg", "Reloading configuration")
-		cfg, err := config.LoadFile(configFile)
-		if err != nil {
-			level.Error(logger).Log("could not load config to reload: %v", err)
-		}
+type Sampler struct {
+	logger     log.Logger
+	configFile string
+	cfg        *config.Config
+	reloaders  *configReloaders
+}
 
-		for _, reloader := range reloaders.funcs {
-			if err := reloader(cfg); err != nil {
-				level.Error(logger).Log("could not reload scrape configs: %v", err)
-			}
+type SamplerOption func(s *Sampler) error
+
+func NewSampler(opts ...SamplerOption) (*Sampler, error) {
+	s := &Sampler{
+		logger: log.NewNopLogger(),
+	}
+
+	for _, opt := range opts {
+		if err := opt(s); err != nil {
+			return nil, err
 		}
+	}
+
+	return s, nil
+}
+
+func WithLogger(logger log.Logger) SamplerOption {
+	return func(s *Sampler) error {
+		s.logger = logger
+		return nil
 	}
 }
 
-func runSampler(
-	g *run.Group,
-	probe prober.Probe,
-	logger log.Logger,
-	db storage.Appendable,
-	configFile string,
-	targets []string,
-	reloadCh chan struct{},
-	reloaders *configReloaders,
-) error {
-	scrapeManager := scrape.NewManager(log.With(logger, "component", "scrape-manager"), db)
-	reloaders.Register(scrapeManager.ApplyConfig)
+func WithConfigFile(path string) SamplerOption {
+	return func(s *Sampler) error {
+		cfg, err := config.LoadFile(path)
+		if err != nil {
+			return fmt.Errorf("could not load config: %w", err)
+		}
+		s.cfg = cfg
+		s.configFile = path
+		return nil
+	}
+}
 
-	var (
-		cfg *config.Config
-		err error
-	)
-	if len(targets) > 0 {
+func WithReloaders(reloaders *configReloaders) SamplerOption {
+	return func(s *Sampler) error {
+		s.reloaders = reloaders
+		return nil
+	}
+}
+
+func WithTargets(targets []string) SamplerOption {
+	const tmpConfig = `
+scrape_configs:
+- job_name: 'default'
+  scrape_interval: 1m
+  scrape_timeout: 1m
+  static_configs:
+  - targets: [%s]
+`
+
+	return func(s *Sampler) error {
 		targetStrings := []string{}
 		for _, t := range targets {
 			targetStrings = append(targetStrings, fmt.Sprintf("\"%s\"", t))
@@ -167,14 +209,7 @@ func runSampler(
 			return fmt.Errorf("could not create tempfile: %v", err)
 		}
 
-		content := fmt.Sprintf(`
-scrape_configs:
-- job_name: 'default'
-  scrape_interval: 1m
-  scrape_timeout: 1m
-  static_configs:
-  - targets: [%s]
-`, strings.Join(targetStrings, ","))
+		content := fmt.Sprintf(tmpConfig, strings.Join(targetStrings, ","))
 		if _, err := tmpfile.Write([]byte(content)); err != nil {
 			return fmt.Errorf("could write tempfile: %v", err)
 		}
@@ -182,22 +217,26 @@ scrape_configs:
 			return fmt.Errorf("could close tempfile: %v", err)
 		}
 
-		configFile = tmpfile.Name()
-		cfg, err = config.LoadFile(configFile)
+		configFile := tmpfile.Name()
+		s.cfg, err = config.LoadFile(configFile)
 		if err != nil {
 			return fmt.Errorf("could not load config: %v", err)
 		}
-	} else {
-		cfg, err = config.LoadFile(configFile)
-		if err != nil {
-			return fmt.Errorf("could not load config: %v", err)
-		}
+
+		return nil
 	}
+}
+
+// Register the sampler to the run.Group to be run concurrently.
+func (s *Sampler) Run(probe prober.Probe, db storage.Appendable, reloadCh chan struct{}) error {
+	scrapeManager := scrape.NewManager(log.With(s.logger, "component", "scrape-manager"), db)
+
+	s.reloaders.Register(scrapeManager.ApplyConfig)
 
 	ctxScrape, cancelScrape := context.WithCancel(context.Background())
-	discoveryManagerScrape := discovery.NewManager(ctxScrape, log.With(logger, "component", "discovery manager scrape"), discovery.Name("scrape"))
+	discoveryManagerScrape := discovery.NewManager(ctxScrape, log.With(s.logger, "component", "discovery manager scrape"), discovery.Name("scrape"))
 
-	reloaders.Register(func(cfg *config.Config) error {
+	s.reloaders.Register(func(cfg *config.Config) error {
 		c := getScrapeConfigs(cfg)
 		for _, v := range cfg.ScrapeConfigs {
 			c[v.JobName] = v.ServiceDiscoveryConfigs
@@ -205,11 +244,36 @@ scrape_configs:
 		return discoveryManagerScrape.ApplyConfig(c)
 	})
 
-	go managerReloader(logger, reloadCh, configFile, reloaders)
+	var g run.Group
 	{
-		err := discoveryManagerScrape.ApplyConfig(getScrapeConfigs(cfg))
+		ctx, cancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-reloadCh:
+					level.Info(s.logger).Log("msg", "Reloading configuration")
+					cfg, err := config.LoadFile(s.configFile)
+					if err != nil {
+						level.Error(s.logger).Log("could not load config to reload: %v", err)
+					}
+
+					for _, reloader := range s.reloaders.funcs {
+						if err := reloader(cfg); err != nil {
+							level.Error(s.logger).Log("could not reload scrape configs: %v", err)
+						}
+					}
+				}
+			}
+		}, func(err error) {
+			cancel()
+		})
+	}
+	{
+		err := discoveryManagerScrape.ApplyConfig(getScrapeConfigs(s.cfg))
 		if err != nil {
-			level.Error(logger).Log("msg", err)
+			level.Error(s.logger).Log("msg", err)
 			cancelScrape()
 			return err
 		}
@@ -217,11 +281,11 @@ scrape_configs:
 		g.Add(
 			func() error {
 				err := discoveryManagerScrape.Run()
-				level.Info(logger).Log("msg", "Scrape discovery manager stopped")
+				level.Info(s.logger).Log("msg", "Scrape discovery manager stopped")
 				return err
 			},
 			func(err error) {
-				level.Info(logger).Log("msg", "Stopping scrape discovery manager...")
+				level.Info(s.logger).Log("msg", "Stopping scrape discovery manager...")
 				cancelScrape()
 			},
 		)
@@ -229,18 +293,19 @@ scrape_configs:
 	{
 		_, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
-			err = scrapeManager.ApplyConfig(cfg)
+			err := scrapeManager.ApplyConfig(s.cfg)
 			if err != nil {
 				return fmt.Errorf("could not apply config: %v", err)
 			}
 			return scrapeManager.Run(discoveryManagerScrape.SyncCh())
 		}, func(error) {
-			level.Debug(logger).Log("msg", "shutting down scrape manager")
+			level.Debug(s.logger).Log("msg", "shutting down scrape manager")
 			scrapeManager.Stop()
 			cancel()
 		})
 	}
 
 	probe.Ready()
-	return nil
+
+	return g.Run()
 }

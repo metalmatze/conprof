@@ -29,11 +29,13 @@ import (
 	"github.com/google/pprof/profile"
 	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql/parser"
+	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 
 	"github.com/conprof/conprof/config"
 	"github.com/conprof/conprof/internal/pprof/measurement"
@@ -43,6 +45,7 @@ var defaultMetadataTimeRange = 24 * time.Hour
 
 type API struct {
 	logger            log.Logger
+	reg               *prometheus.Registry
 	db                storage.Queryable
 	reloadCh          chan struct{}
 	maxMergeBatchSize int64
@@ -53,16 +56,35 @@ type API struct {
 
 func New(
 	logger log.Logger,
+	reg *prometheus.Registry,
 	db storage.Queryable,
 	reloadCh chan struct{},
 	maxMergeBatchSize int64,
 ) *API {
 	return &API{
 		logger:            logger,
+		reg:               reg,
 		db:                db,
 		reloadCh:          reloadCh,
 		maxMergeBatchSize: maxMergeBatchSize,
 	}
+}
+
+func (a *API) Router() *httprouter.Router {
+	logger := log.With(a.logger, "component", "api")
+
+	router := httprouter.New()
+	router.RedirectTrailingSlash = false
+	ins := extpromhttp.NewInstrumentationMiddleware(a.reg)
+	instr := Instr(logger, ins)
+
+	router.GET("/query_range", instr("query_range", a.QueryRange))
+	router.GET("/query", instr("query", a.Query))
+	router.GET("/series", instr("series", a.Series))
+	router.GET("/labels", instr("label_names", a.LabelNames))
+	router.GET("/label/:name/values", instr("label_values", a.LabelValues))
+
+	return router
 }
 
 func (a *API) ApplyConfig(c *config.Config) error {

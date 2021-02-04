@@ -14,6 +14,8 @@
 package main
 
 import (
+	"time"
+
 	"github.com/conprof/db/tsdb"
 	"github.com/conprof/db/tsdb/wal"
 	"github.com/go-kit/kit/log"
@@ -25,6 +27,46 @@ import (
 	"github.com/thanos-io/thanos/pkg/prober"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
+
+type AllCmd struct {
+	configFileFlag
+	httpFlags
+
+	StoragePath string        `name:"storage.tsdb.path" type:"path" default:"./data" help:"Directory to read storage from."`
+	Retention   time.Duration `name:"storage.tsdb.retention.time" default:"360h" help:"How long to retain raw samples on local storage. 0d - disables this retention"` // TODO: Support Prometheus duration
+}
+
+func (a *AllCmd) Run(cli *cliContext) error {
+	_, err := tsdb.Open(
+		a.StoragePath,
+		cli.logger,
+		cli.registry,
+		&tsdb.Options{
+			RetentionDuration:      int64(a.Retention),
+			WALSegmentSize:         wal.DefaultSegmentSize,
+			MinBlockDuration:       tsdb.DefaultBlockDuration,
+			MaxBlockDuration:       int64(a.Retention) / 10,
+			NoLockfile:             true,
+			AllowOverlappingBlocks: false,
+			WALCompression:         true,
+			StripeSize:             tsdb.DefaultStripeSize,
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	//if err := runSampler(g, p, logger, db, a.ConfigFile, nil, reloadCh, reloaders); err != nil {
+	//	return err
+	//
+	//}
+	//
+	//if err = runWeb(mux, p, reg, logger, db, reloadCh, reloaders, a.MaxMergeBatchSize); err != nil {
+	//	return err
+	//}
+
+	return nil
+}
 
 // registerAll registers the all command.
 func registerAll(m map[string]setupFunc, app *kingpin.Application, name string, reloadCh chan struct{}, reloaders *configReloaders) {
@@ -58,7 +100,7 @@ func registerAll(m map[string]setupFunc, app *kingpin.Application, name string, 
 
 func runAll(
 	comp component.Component,
-	g *run.Group,
+	gOld *run.Group,
 	mux httpMux,
 	p prober.Probe,
 	reg prometheus.Registerer,
@@ -89,15 +131,33 @@ func runAll(
 		return nil, err
 	}
 
-	err = runSampler(g, p, logger, db, configFile, nil, reloadCh, reloaders)
-	if err != nil {
-		return nil, err
+	var g run.Group
+	{
+		s, err := NewSampler(
+			WithLogger(logger),
+			WithConfigFile(configFile),
+			WithReloaders(reloaders),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		g.Add(func() error {
+			return s.Run(p, db, reloadCh)
+		}, func(err error) {
+		})
+	}
+	{
+		ws := NewWebserver("",
+			WebserverWithLogger(logger),
+			//WebserverWithRegistry(reg),
+		)
+
+		g.Add(func() error {
+			return ws.Run(db, maxMergeBatchSize, reloadCh, reloaders)
+		}, func(err error) {
+		})
 	}
 
-	err = runWeb(mux, p, reg, logger, db, reloadCh, reloaders, maxMergeBatchSize)
-	if err != nil {
-		return nil, err
-	}
-
-	return p, nil
+	return p, g.Run()
 }

@@ -4,6 +4,8 @@ go 1.15
 
 require (
 	github.com/NYTimes/gziphandler v1.1.1
+	github.com/alecthomas/kong v0.2.12
+	github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d
 	github.com/conprof/db v0.0.0-20201217141952-41a07eb32021
 	github.com/cortexproject/cortex v1.5.1-0.20201111110551-ba512881b076
 	github.com/go-kit/kit v0.10.0
